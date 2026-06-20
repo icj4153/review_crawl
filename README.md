@@ -34,7 +34,7 @@ python app.py
 로컬 테스트:
 
 ```powershell
-streamlit run web_app.py --server.port 8502
+python web_app.py
 ```
 
 Docker/NAS 실행:
@@ -43,7 +43,7 @@ Docker/NAS 실행:
 docker compose up -d --build
 ```
 
-기본 포트는 `8502`입니다. `docker-compose.yml`은 `127.0.0.1:8502`로 바인딩되어 있으므로, NAS 리버스 프록시를 붙이거나 LAN에서 바로 열려면 포트 바인딩을 `8502:8502`로 바꾸면 됩니다.
+기본 포트는 `8502`입니다. `docker-compose.yml`은 `127.0.0.1:8502`로 바인딩되어 있으므로, NAS 리버스 프록시를 붙이거나 LAN에서 바로 열려면 포트 바인딩을 `8502:8502`로 바꾸면 됩니다. 웹 서비스 화면은 일반 HTTP 폴링 방식이라 Streamlit WebSocket 설정이 필요하지 않습니다.
 
 ## GitHub Actions CI/CD
 
