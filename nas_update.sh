@@ -27,4 +27,6 @@ else
     pull --ff-only
 fi
 
+mkdir -p output
+
 "$COMPOSE" up -d --build
