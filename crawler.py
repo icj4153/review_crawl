@@ -46,6 +46,9 @@ def resolve_edge_path() -> str | None:
         os.path.join(os.environ.get("ProgramFiles", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
         os.path.join(os.environ.get("ProgramFiles(x86)", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
         os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Edge", "Application", "msedge.exe"),
+        "/usr/bin/microsoft-edge",
+        "/usr/bin/microsoft-edge-stable",
+        "/opt/microsoft/msedge/msedge",
     ]
     for candidate in candidates:
         if candidate and Path(candidate).exists():
@@ -410,6 +413,10 @@ class NaverReviewCrawler:
             self._log("화면에서 더 이상 새 리뷰가 보이지 않아 현재 수집분으로 종료합니다.")
 
     def _collect_with_edge(self, playwright: Any, target_url: str, max_reviews: int, stop_event: threading.Event) -> None:
+        if self.edge_path and not self.edge_path.lower().endswith(".exe"):
+            self._collect_with_linux_edge(playwright, target_url, max_reviews, stop_event)
+            return
+
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         runtime_profile_dir = Path(tempfile.mkdtemp(prefix="edge_run_", dir=str(self.profile_dir)))
 
@@ -456,6 +463,35 @@ class NaverReviewCrawler:
                 except Exception:
                     process.kill()
             shutil.rmtree(runtime_profile_dir, ignore_errors=True)
+
+    def _collect_with_linux_edge(self, playwright: Any, target_url: str, max_reviews: int, stop_event: threading.Event) -> None:
+        self._log(f"Microsoft Edge 실행: {self.edge_path}")
+        browser = playwright.chromium.launch(
+            executable_path=self.edge_path,
+            headless=self.headless,
+            args=[
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+        try:
+            context = browser.new_context(
+                locale="ko-KR",
+                viewport={"width": 1280, "height": 900},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0"
+                ),
+            )
+            page = context.new_page()
+            self._collect_from_page(page, target_url, max_reviews, stop_event)
+        finally:
+            try:
+                browser.close()
+            except Exception:
+                pass
 
     def _collect_with_chromium(self, playwright: Any, target_url: str, max_reviews: int, stop_event: threading.Event) -> None:
         mode_label = "화면 보기" if not self.headless else "headless"

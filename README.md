@@ -14,7 +14,7 @@ python -m pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
-Windows 데스크톱 앱은 설치된 Microsoft Edge를 사용합니다. NAS 웹 서비스는 Playwright Chromium을 사용하며, 기본값은 브라우저 화면 보기 모드입니다.
+Windows 데스크톱 앱은 설치된 Microsoft Edge를 사용합니다. NAS 웹 서비스도 Docker 이미지 안에 Linux용 Microsoft Edge Stable을 설치해 사용하며, 기본값은 브라우저 화면 보기 모드입니다.
 
 ## Windows 앱 실행
 
@@ -45,7 +45,7 @@ docker compose up -d --build
 
 기본 포트는 `8502`입니다. `docker-compose.yml`은 `127.0.0.1:8502`로 바인딩되어 있으므로, NAS 리버스 프록시를 붙이거나 LAN에서 바로 열려면 포트 바인딩을 `8502:8502`로 바꾸면 됩니다. 웹 서비스 화면은 일반 HTTP 폴링 방식이라 Streamlit WebSocket 설정이 필요하지 않습니다.
 
-수집 화면의 `브라우저 화면 보기`를 켜면 Chromium을 headless가 아닌 화면 보기 모드로 실행하고, 현재 브라우저 화면을 웹 페이지에서 자동 갱신합니다. NAS Docker에서는 가상 디스플레이를 사용하므로 실제 모니터 창 대신 웹 화면 안에서 확인합니다.
+수집 화면의 `브라우저 화면 보기`를 켜면 Edge를 headless가 아닌 화면 보기 모드로 실행하고, 현재 브라우저 화면을 웹 페이지에서 자동 갱신합니다. NAS Docker에서는 가상 디스플레이를 사용하므로 실제 모니터 창 대신 웹 화면 안에서 확인합니다.
 
 ## GitHub Actions CI/CD
 

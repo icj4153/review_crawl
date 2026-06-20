@@ -8,7 +8,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 COPY requirements.txt ./
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends xvfb fonts-noto-cjk \
+    && apt-get install -y --no-install-recommends ca-certificates gnupg wget xvfb fonts-noto-cjk \
+    && mkdir -p /etc/apt/keyrings \
+    && wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > /etc/apt/keyrings/microsoft.gpg \
+    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/edge stable main" > /etc/apt/sources.list.d/microsoft-edge.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends microsoft-edge-stable \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir -r requirements.txt \
     && python -m playwright install chromium

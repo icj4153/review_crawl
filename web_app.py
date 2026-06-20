@@ -103,7 +103,7 @@ def select_browser_mode() -> str:
     configured = os.getenv("REVIEW_BROWSER_MODE", "").strip().lower()
     if configured in {"edge", "chromium"}:
         return configured
-    if os.name == "nt" and resolve_edge_path():
+    if resolve_edge_path():
         return "edge"
     return "chromium"
 

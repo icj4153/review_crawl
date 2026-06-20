@@ -9,6 +9,7 @@ services:
     environment:
       TZ: KST-9
       REVIEW_OUTPUT_DIR: /app/output
+      REVIEW_BROWSER_MODE: edge
     ports:
       - "127.0.0.1:8502:8502"
     volumes:
