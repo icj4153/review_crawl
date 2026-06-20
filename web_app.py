@@ -15,6 +15,7 @@ from crawler import (
     NaverReviewCrawler,
     is_supported_naver_store_url,
     normalize_naver_store_product_url,
+    resolve_edge_path,
 )
 from excel_writer import save_reviews_xlsx
 
@@ -98,6 +99,15 @@ def list_recent_files(limit: int = MAX_RECENT_FILES) -> list[Path]:
     return sorted(OUTPUT_DIR.glob("*.xlsx"), key=lambda path: path.stat().st_mtime, reverse=True)[:limit]
 
 
+def select_browser_mode() -> str:
+    configured = os.getenv("REVIEW_BROWSER_MODE", "").strip().lower()
+    if configured in {"edge", "chromium"}:
+        return configured
+    if os.name == "nt" and resolve_edge_path():
+        return "edge"
+    return "chromium"
+
+
 def prune_jobs() -> None:
     with jobs_lock:
         if len(jobs) <= MAX_JOB_HISTORY:
@@ -115,12 +125,14 @@ def run_collect_job(job: CollectJob) -> None:
         normalized_url = normalize_naver_store_product_url(job.url)
         job.add_log(f"수집 URL: {normalized_url}")
         job.add_log(f"최대 리뷰수: {job.max_reviews}")
+        browser_mode = select_browser_mode()
+        job.add_log(f"브라우저 모드: {'Microsoft Edge' if browser_mode == 'edge' else 'Chromium'}")
         if job.visible_browser:
             job.add_log("브라우저 화면 보기 모드로 실행합니다.")
 
         crawler = NaverReviewCrawler(
-            browser_mode="chromium",
-            headless=not job.visible_browser,
+            browser_mode=browser_mode,
+            headless=False if browser_mode == "edge" else not job.visible_browser,
             screenshot_path=Path(job.screenshot_path) if job.screenshot_path else None,
             log=job.add_log,
         )

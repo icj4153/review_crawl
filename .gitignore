@@ -12,6 +12,7 @@ output/
 *.xlsx
 *.log
 streamlit_test.*
+.web_app_local.pid
 
 .pytest_cache/
 .mypy_cache/
