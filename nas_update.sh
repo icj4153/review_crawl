@@ -30,5 +30,14 @@ fi
 mkdir -p output
 
 "$DOCKER" rm -f naver-review-web 2>/dev/null || true
+wait_count=0
+while "$DOCKER" ps -a --filter name=naver-review-web --format '{{.Names}}' | grep -q '^naver-review-web$'; do
+  if [ "$wait_count" -ge 30 ]; then
+    echo "Timed out waiting for naver-review-web removal"
+    exit 1
+  fi
+  wait_count=$((wait_count + 1))
+  sleep 1
+done
 
 "$COMPOSE" up -d --build
