@@ -14,4 +14,4 @@ COPY . .
 
 EXPOSE 8502
 
-CMD ["python", "web_app.py"]
+CMD ["gunicorn", "--bind=0.0.0.0:8502", "--workers=1", "--threads=4", "--timeout=600", "web_app:app"]
