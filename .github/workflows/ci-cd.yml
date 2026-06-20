@@ -1,0 +1,154 @@
+name: CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  group: review-crawl-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: Test and Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Compile Python files
+        run: |
+          python -m py_compile app.py crawler.py excel_writer.py web_app.py
+
+      - name: Smoke test helpers
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from openpyxl import load_workbook
+
+          from crawler import (
+              Review,
+              is_supported_naver_store_url,
+              normalize_naver_store_product_url,
+          )
+          from excel_writer import HEADERS, save_reviews_xlsx
+
+          assert is_supported_naver_store_url("https://smartstore.naver.com/ogamfruit/products/10212511121?x=1")
+          assert is_supported_naver_store_url("https://brand.naver.com/jiksong/products/6836326726?x=1")
+          assert not is_supported_naver_store_url("https://example.com/products/1")
+          assert normalize_naver_store_product_url(
+              "https://brand.naver.com/jiksong/products/6836326726?NaPm=test"
+          ) == "https://brand.naver.com/jiksong/products/6836326726"
+
+          output = Path("ci_smoke.xlsx")
+          reviews = [
+              Review(
+                  review_no="screen-test",
+                  product_no="6836326726",
+                  product_name="test product",
+                  writer="ab**",
+                  created_at="2026-06-20 00:00:00",
+                  rating="5",
+                  content="good",
+                  image_urls=["https://example.com/a.jpg"],
+              )
+          ]
+          save_reviews_xlsx(reviews, output)
+          sheet = load_workbook(output).active
+          assert [sheet.cell(1, col).value for col in range(1, 9)] == HEADERS
+          assert sheet.cell(2, 8).value == "https://example.com/a.jpg"
+          output.unlink()
+          PY
+
+      - name: Docker build
+        run: docker build -t review-crawl-web:ci .
+
+  deploy:
+    name: Deploy to NAS
+    needs: ci
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in NAS_HOST NAS_PORT NAS_USER NAS_SSH_PRIVATE_KEY NAS_KNOWN_HOSTS; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Missing required GitHub Secret: $name"
+              missing=1
+            fi
+          done
+          exit "$missing"
+        env:
+          NAS_HOST: ${{ secrets.NAS_HOST }}
+          NAS_PORT: ${{ secrets.NAS_PORT }}
+          NAS_USER: ${{ secrets.NAS_USER }}
+          NAS_SSH_PRIVATE_KEY: ${{ secrets.NAS_SSH_PRIVATE_KEY }}
+          NAS_KNOWN_HOSTS: ${{ secrets.NAS_KNOWN_HOSTS }}
+
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$NAS_SSH_PRIVATE_KEY" > ~/.ssh/nas_deploy_key
+          printf '%s\n' "$NAS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/nas_deploy_key
+          chmod 644 ~/.ssh/known_hosts
+          ssh-keygen -y -f ~/.ssh/nas_deploy_key >/dev/null
+        env:
+          NAS_SSH_PRIVATE_KEY: ${{ secrets.NAS_SSH_PRIVATE_KEY }}
+          NAS_KNOWN_HOSTS: ${{ secrets.NAS_KNOWN_HOSTS }}
+
+      - name: Verify NAS SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh \
+            -i ~/.ssh/nas_deploy_key \
+            -p "$NAS_PORT" \
+            -o BatchMode=yes \
+            "$NAS_USER@$NAS_HOST" \
+            'echo github-actions-ssh-ok'
+        env:
+          NAS_HOST: ${{ secrets.NAS_HOST }}
+          NAS_PORT: ${{ secrets.NAS_PORT }}
+          NAS_USER: ${{ secrets.NAS_USER }}
+
+      - name: Deploy on NAS
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh \
+            -i ~/.ssh/nas_deploy_key \
+            -p "$NAS_PORT" \
+            -o BatchMode=yes \
+            "$NAS_USER@$NAS_HOST" \
+            'set -eu
+             cd /volume1/docker/review_crawl
+             sh nas_update.sh
+             PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+             /usr/local/bin/docker ps --filter name=naver-review-web
+             /usr/local/bin/docker-compose logs --tail=60 review-web'
+        env:
+          NAS_HOST: ${{ secrets.NAS_HOST }}
+          NAS_PORT: ${{ secrets.NAS_PORT }}
+          NAS_USER: ${{ secrets.NAS_USER }}
