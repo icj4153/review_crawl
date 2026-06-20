@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 from flask import Flask, jsonify, request, send_file
@@ -31,6 +31,7 @@ IMAGE_ZIP_DIR = OUTPUT_DIR / ".image_zips"
 MAX_RECENT_FILES = 20
 MAX_JOB_HISTORY = 30
 MAX_IMAGE_ZIP_HISTORY = 30
+MAX_MANAGED_FILES = 100
 IMAGE_REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -156,23 +157,141 @@ def list_recent_files(limit: int = MAX_RECENT_FILES) -> list[Path]:
     return sorted(OUTPUT_DIR.glob("*.xlsx"), key=lambda path: path.stat().st_mtime, reverse=True)[:limit]
 
 
-def resolve_output_xlsx(filename: str) -> Path:
+def list_image_zip_files(limit: int = MAX_MANAGED_FILES) -> list[Path]:
+    IMAGE_ZIP_DIR.mkdir(parents=True, exist_ok=True)
+    return sorted(IMAGE_ZIP_DIR.glob("*.zip"), key=lambda path: path.stat().st_mtime, reverse=True)[:limit]
+
+
+def managed_file_config(kind: str) -> dict[str, Any]:
+    if kind == "excel":
+        return {
+            "dir": OUTPUT_DIR,
+            "extension": ".xlsx",
+            "default_stem": "naver_reviews",
+            "download_prefix": "/download/file",
+        }
+    if kind == "image_zip":
+        return {
+            "dir": IMAGE_ZIP_DIR,
+            "extension": ".zip",
+            "default_stem": "naver_review_images",
+            "download_prefix": "/download/image-file",
+        }
+    raise ValueError("지원하지 않는 파일 종류입니다.")
+
+
+def file_payload(path: Path, kind: str) -> dict[str, Any]:
+    stat = path.stat()
+    prefix = managed_file_config(kind)["download_prefix"]
+    return {
+        "kind": kind,
+        "name": path.name,
+        "size": stat.st_size,
+        "updated_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+        "download_url": f"{prefix}/{quote(path.name)}",
+    }
+
+
+def normalize_new_managed_filename(kind: str, filename: str) -> str:
+    config = managed_file_config(kind)
+    extension = config["extension"]
     name = str(filename or "").strip()
     if not name or "/" in name or "\\" in name or Path(name).name != name:
-        raise ValueError("파일명이 올바르지 않습니다.")
-    if not name.lower().endswith(".xlsx"):
-        raise ValueError("엑셀 파일만 처리할 수 있습니다.")
+        raise ValueError("새 파일명이 올바르지 않습니다.")
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    base = OUTPUT_DIR.resolve()
-    path = (OUTPUT_DIR / name).resolve()
+    suffix = Path(name).suffix
+    if suffix and suffix.lower() != extension:
+        raise ValueError(f"{extension} 확장자만 사용할 수 있습니다.")
+    stem = name[: -len(extension)] if name.lower().endswith(extension) else name
+    stem = safe_filename(stem, default=config["default_stem"])
+    return f"{stem}{extension}"
+
+
+def resolve_managed_file(kind: str, filename: str, *, must_exist: bool = True) -> Path:
+    config = managed_file_config(kind)
+    name = str(filename or "").strip()
+    extension = config["extension"]
+    if not name or "/" in name or "\\" in name or Path(name).name != name:
+        raise ValueError("파일명이 올바르지 않습니다.")
+    if not name.lower().endswith(extension):
+        raise ValueError(f"{extension} 파일만 처리할 수 있습니다.")
+
+    base_dir = Path(config["dir"])
+    base_dir.mkdir(parents=True, exist_ok=True)
+    base = base_dir.resolve()
+    path = (base_dir / name).resolve()
     try:
         path.relative_to(base)
     except ValueError as exc:
         raise ValueError("출력 폴더 밖의 파일은 처리할 수 없습니다.") from exc
-    if not path.exists() or not path.is_file():
+    if must_exist and (not path.exists() or not path.is_file()):
         raise FileNotFoundError("파일을 찾을 수 없습니다.")
     return path
+
+
+def resolve_output_xlsx(filename: str) -> Path:
+    return resolve_managed_file("excel", filename)
+
+
+def update_file_references(old_path: Path, new_path: Path | None, kind: str) -> None:
+    old_resolved = old_path.resolve()
+    with jobs_lock:
+        if kind == "excel":
+            for job in jobs.values():
+                if job.output_path and Path(job.output_path).resolve() == old_resolved:
+                    if new_path:
+                        job.output_path = str(new_path)
+                        job.filename = new_path.name
+                    else:
+                        job.output_path = ""
+                        job.filename = ""
+        elif kind == "image_zip":
+            for job in image_zip_jobs.values():
+                if job.zip_path and Path(job.zip_path).resolve() == old_resolved:
+                    if new_path:
+                        job.zip_path = str(new_path)
+                        job.zip_filename = new_path.name
+                    else:
+                        job.zip_path = ""
+                        job.zip_filename = ""
+
+
+def rename_managed_file(kind: str, filename: str, new_filename: str) -> dict[str, Any]:
+    source = resolve_managed_file(kind, filename)
+    target_name = normalize_new_managed_filename(kind, new_filename)
+    target = resolve_managed_file(kind, target_name, must_exist=False)
+    if source.resolve() == target.resolve():
+        return file_payload(source, kind)
+    if target.exists():
+        raise FileExistsError("같은 이름의 파일이 이미 있습니다.")
+    source.rename(target)
+    update_file_references(source, target, kind)
+    return file_payload(target, kind)
+
+
+def delete_managed_file(kind: str, filename: str) -> None:
+    path = resolve_managed_file(kind, filename)
+    path.unlink()
+    update_file_references(path, None, kind)
+
+
+def next_available_managed_file(kind: str, filename: str) -> Path:
+    target = resolve_managed_file(kind, filename, must_exist=False)
+    if not target.exists():
+        return target
+
+    base = target.with_suffix("")
+    suffix = target.suffix
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    candidate = Path(f"{base}_{timestamp}{suffix}")
+    if not candidate.exists():
+        return candidate
+
+    for index in range(2, 1000):
+        candidate = Path(f"{base}_{timestamp}_{index}{suffix}")
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError("사용 가능한 파일명을 만들지 못했습니다.")
 
 
 def parse_rating(value: object) -> float | None:
@@ -229,7 +348,8 @@ def run_image_zip_job(job: ImageZipJob) -> None:
     source_path = Path(job.source_path)
     zip_base = safe_filename(f"{source_path.stem}_이미지", default="naver_review_images")
     zip_filename = f"{zip_base}.zip"
-    zip_path = IMAGE_ZIP_DIR / f"{job.id}_{zip_filename}"
+    zip_path = next_available_managed_file("image_zip", zip_filename)
+    zip_filename = zip_path.name
 
     try:
         job.add_log(f"엑셀 파일 읽는 중: {source_path.name}")
@@ -463,18 +583,44 @@ def job_screenshot(job_id: str):
 
 @app.get("/api/files")
 def recent_files():
-    files = []
-    for path in list_recent_files():
-        stat = path.stat()
-        files.append(
-            {
-                "name": path.name,
-                "size": stat.st_size,
-                "updated_at": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-                "download_url": f"/download/file/{path.name}",
-            }
-        )
-    return jsonify({"files": files})
+    files = [file_payload(path, "excel") for path in list_recent_files(limit=MAX_MANAGED_FILES)]
+    image_zips = [file_payload(path, "image_zip") for path in list_image_zip_files(limit=MAX_MANAGED_FILES)]
+    return jsonify({"files": files, "image_zips": image_zips})
+
+
+@app.post("/api/files/rename")
+def rename_file():
+    payload = request.get_json(silent=True) or {}
+    kind = str(payload.get("kind", "")).strip()
+    filename = str(payload.get("filename", "")).strip()
+    new_filename = str(payload.get("new_filename", "")).strip()
+    try:
+        file_info = rename_managed_file(kind, filename, new_filename)
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except FileExistsError as exc:
+        return jsonify({"error": str(exc)}), 409
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except OSError as exc:
+        return jsonify({"error": f"파일 이름을 바꾸지 못했습니다: {exc}"}), 500
+    return jsonify({"file": file_info})
+
+
+@app.post("/api/files/delete")
+def delete_file():
+    payload = request.get_json(silent=True) or {}
+    kind = str(payload.get("kind", "")).strip()
+    filename = str(payload.get("filename", "")).strip()
+    try:
+        delete_managed_file(kind, filename)
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except OSError as exc:
+        return jsonify({"error": f"파일을 삭제하지 못했습니다: {exc}"}), 500
+    return jsonify({"ok": True})
 
 
 @app.post("/api/image-zips")
@@ -521,10 +667,13 @@ def download_job(job_id: str):
 
 @app.get("/download/file/<filename>")
 def download_file(filename: str):
-    for path in list_recent_files(limit=200):
-        if path.name == filename:
-            return send_file(path, as_attachment=True, download_name=path.name)
-    return jsonify({"error": "파일을 찾을 수 없습니다."}), 404
+    try:
+        path = resolve_managed_file("excel", filename)
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return send_file(path, as_attachment=True, download_name=path.name)
 
 
 @app.get("/download/images/<zip_job_id>")
@@ -537,6 +686,17 @@ def download_image_zip(zip_job_id: str):
     if not path.exists():
         return jsonify({"error": "이미지 ZIP 파일을 찾을 수 없습니다."}), 404
     return send_file(path, as_attachment=True, download_name=job.zip_filename or path.name)
+
+
+@app.get("/download/image-file/<filename>")
+def download_image_file(filename: str):
+    try:
+        path = resolve_managed_file("image_zip", filename)
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return send_file(path, as_attachment=True, download_name=path.name)
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -570,7 +730,7 @@ INDEX_HTML = r"""<!doctype html>
       width: min(1180px, calc(100vw - 32px));
       margin: 28px auto;
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 320px;
+      grid-template-columns: minmax(0, 1fr) 380px;
       gap: 18px;
     }
     header {
@@ -771,9 +931,25 @@ INDEX_HTML = r"""<!doctype html>
       margin: 0 0 12px;
       font-size: 16px;
     }
+    .side-note {
+      margin: -6px 0 14px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
     .file-list {
       display: grid;
+      gap: 12px;
+    }
+    .file-group {
+      display: grid;
       gap: 9px;
+    }
+    .file-group-title {
+      margin-top: 2px;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 800;
     }
     .file {
       border: 1px solid var(--line);
@@ -781,11 +957,21 @@ INDEX_HTML = r"""<!doctype html>
       padding: 10px;
       background: #fbfcfe;
     }
+    .file.empty {
+      color: var(--muted);
+      font-size: 12px;
+    }
     .file a {
       display: block;
       color: var(--primary);
       text-decoration: none;
       font-weight: 700;
+      word-break: break-all;
+    }
+    .file-name {
+      color: var(--text);
+      font-weight: 800;
+      line-height: 1.45;
       word-break: break-all;
     }
     .file span {
@@ -802,6 +988,16 @@ INDEX_HTML = r"""<!doctype html>
     }
     .file-actions button,
     .file-actions .download {
+      min-height: 34px;
+      padding: 7px 10px;
+      font-size: 12px;
+    }
+    .file-actions .download {
+      display: inline-flex;
+      color: #fff;
+      word-break: normal;
+    }
+    .file-actions button.danger {
       min-height: 34px;
       padding: 7px 10px;
       font-size: 12px;
@@ -885,7 +1081,8 @@ INDEX_HTML = r"""<!doctype html>
     </section>
 
     <aside class="panel side">
-      <h2>최근 저장 파일</h2>
+      <h2>파일 관리</h2>
+      <div class="side-note">저장된 엑셀과 이미지 ZIP 파일을 다운로드, 이름 변경, 삭제할 수 있습니다.</div>
       <div id="files" class="file-list"></div>
     </aside>
   </main>
@@ -1075,35 +1272,129 @@ INDEX_HTML = r"""<!doctype html>
         }
         if (renderImageZipJob(job, statusEl, button)) {
           clearInterval(timer);
+          if (job.status === "done") {
+            loadRecentFiles();
+          }
         }
       }, 1500);
+    }
+
+    function fileSizeLabel(size) {
+      return `${(Number(size || 0) / 1024).toFixed(1)} KB`;
+    }
+
+    function fileKindLabel(kind) {
+      return kind === "image_zip" ? "이미지 ZIP" : "엑셀";
+    }
+
+    function renderFileCard(file) {
+      const isExcel = file.kind === "excel";
+      const downloadText = isExcel ? "엑셀 다운로드" : "ZIP 다운로드";
+      const zipButton = isExcel
+        ? `<button class="secondary image-zip-btn" type="button" data-filename="${escapeHtml(file.name)}">이미지 ZIP 생성</button>`
+        : "";
+      return `
+        <div class="file" data-kind="${escapeHtml(file.kind)}" data-filename="${escapeHtml(file.name)}">
+          <div class="file-name">${escapeHtml(file.name)}</div>
+          <span>${fileKindLabel(file.kind)} · ${escapeHtml(file.updated_at)} · ${fileSizeLabel(file.size)}</span>
+          <div class="file-actions">
+            <a class="download" href="${escapeHtml(file.download_url)}">${downloadText}</a>
+            ${zipButton}
+            <button class="secondary rename-file-btn" type="button">이름 변경</button>
+            <button class="danger delete-file-btn" type="button">삭제</button>
+          </div>
+          <div class="zip-status" aria-live="polite"></div>
+        </div>
+      `;
+    }
+
+    function renderFileGroup(title, items, emptyText) {
+      const body = items.length
+        ? items.map(renderFileCard).join("")
+        : `<div class="file empty">${emptyText}</div>`;
+      return `
+        <div class="file-group">
+          <div class="file-group-title">${title}</div>
+          ${body}
+        </div>
+      `;
+    }
+
+    async function renameManagedFile(kind, filename) {
+      const nextName = prompt(`${fileKindLabel(kind)} 파일의 새 이름을 입력하세요.`, filename);
+      if (nextName === null) return;
+      const trimmed = nextName.trim();
+      if (!trimmed) {
+        alert("새 파일명을 입력하세요.");
+        return;
+      }
+
+      const res = await fetch("/api/files/rename", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind, filename, new_filename: trimmed })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || "파일 이름을 변경하지 못했습니다.");
+        return;
+      }
+      setMessage("파일 이름을 변경했습니다.", "done");
+      loadRecentFiles();
+    }
+
+    async function deleteManagedFile(kind, filename) {
+      if (!confirm(`${filename}\n\n이 파일을 삭제할까요? 삭제 후 되돌릴 수 없습니다.`)) return;
+      const res = await fetch("/api/files/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind, filename })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || "파일을 삭제하지 못했습니다.");
+        return;
+      }
+      setMessage("파일을 삭제했습니다.", "done");
+      loadRecentFiles();
     }
 
     async function loadRecentFiles() {
       const res = await fetch("/api/files");
       const data = await res.json();
-      if (!data.files || !data.files.length) {
+      const excelFiles = data.files || [];
+      const imageZips = data.image_zips || [];
+      if (!excelFiles.length && !imageZips.length) {
         files.innerHTML = `<div class="message">저장된 파일이 없습니다.</div>`;
         return;
       }
-      files.innerHTML = data.files.map(file => `
-        <div class="file">
-          <a href="${escapeHtml(file.download_url)}">${escapeHtml(file.name)}</a>
-          <span>${escapeHtml(file.updated_at)} · ${(file.size / 1024).toFixed(1)} KB</span>
-          <div class="file-actions">
-            <button class="secondary image-zip-btn" type="button" data-filename="${escapeHtml(file.name)}">이미지 ZIP 생성</button>
-          </div>
-          <div class="zip-status" aria-live="polite"></div>
-        </div>
-      `).join("");
+      files.innerHTML = [
+        renderFileGroup("엑셀 파일", excelFiles, "저장된 엑셀 파일이 없습니다."),
+        renderFileGroup("이미지 ZIP 파일", imageZips, "생성된 이미지 ZIP 파일이 없습니다.")
+      ].join("");
     }
 
     startBtn.addEventListener("click", startJob);
     stopBtn.addEventListener("click", stopJob);
     files.addEventListener("click", event => {
-      const button = event.target.closest(".image-zip-btn");
-      if (!button) return;
-      startImageZip(button.dataset.filename, button);
+      const imageZipButton = event.target.closest(".image-zip-btn");
+      if (imageZipButton) {
+        startImageZip(imageZipButton.dataset.filename, imageZipButton);
+        return;
+      }
+
+      const renameButton = event.target.closest(".rename-file-btn");
+      if (renameButton) {
+        const card = renameButton.closest(".file");
+        renameManagedFile(card.dataset.kind, card.dataset.filename);
+        return;
+      }
+
+      const deleteButton = event.target.closest(".delete-file-btn");
+      if (deleteButton) {
+        const card = deleteButton.closest(".file");
+        deleteManagedFile(card.dataset.kind, card.dataset.filename);
+      }
     });
     loadRecentFiles();
   </script>
