@@ -10,6 +10,8 @@ services:
       TZ: KST-9
       REVIEW_OUTPUT_DIR: /app/output
       REVIEW_BROWSER_MODE: edge
+      NAVER_LOGIN_ID: ${NAVER_LOGIN_ID:-}
+      NAVER_LOGIN_PASSWORD: ${NAVER_LOGIN_PASSWORD:-}
     ports:
       - "127.0.0.1:8502:8502"
     volumes:

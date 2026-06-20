@@ -29,6 +29,26 @@ LogCallback = Callable[[str], None]
 SUPPORTED_NAVER_STORE_HOSTS = {"smartstore.naver.com", "brand.naver.com"}
 
 
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip().lstrip("\ufeff")
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception:
+        return
+
+
+load_env_file(Path(__file__).resolve().parent / ".env")
+
+
 @dataclass(slots=True)
 class Review:
     review_no: str
@@ -396,6 +416,7 @@ class NaverReviewCrawler:
         return self.reviews[:max_reviews]
 
     def _collect_from_page(self, page: Page, target_url: str, max_reviews: int, stop_event: threading.Event) -> None:
+        self._login_before_collect_if_configured(page, target_url)
         self._log("상품 페이지로 바로 이동 중...")
         page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
         self._capture_screenshot(page, force=True)
@@ -525,12 +546,102 @@ class NaverReviewCrawler:
         if "nid.naver.com" not in page.url:
             return
 
-        self._log("로그인 페이지로 이동되어 기본 상품 URL로 다시 접속합니다.")
+        self._log("로그인 페이지로 이동되어 네이버 자동 로그인을 시도합니다.")
+        if self._login_to_naver(page, target_url):
+            self._log("네이버 로그인 완료. 상품 URL로 다시 접속합니다.")
+            page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
+            if "nid.naver.com" not in page.url:
+                return
+
+        self._log("자동 로그인 후에도 로그인 페이지가 표시되어 기본 상품 URL로 다시 접속합니다.")
         page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
         if "nid.naver.com" in page.url:
-            raise RuntimeError("네이버가 로그인 페이지로 이동시켰습니다. 기본 상품 URL로도 로그인 없이 열리지 않습니다.")
+            raise RuntimeError(
+                "네이버 로그인 페이지에서 벗어나지 못했습니다. 보안확인, 2단계 인증, 캡차 또는 계정 보호 화면이 표시되었을 수 있습니다."
+            )
 
         self._log("기본 상품 URL 접속 확인. 로그인 없이 수집을 계속합니다.")
+
+    def _login_before_collect_if_configured(self, page: Page, target_url: str) -> None:
+        if not self._naver_credentials():
+            return
+        login_url = f"https://nid.naver.com/nidlogin.login?mode=form&url={quote(target_url, safe='')}"
+        self._log("네이버 로그인 정보가 설정되어 상품 접속 전에 먼저 로그인합니다.")
+        page.goto(login_url, wait_until="domcontentloaded", timeout=60_000)
+        self._capture_screenshot(page, force=True)
+
+        if "nid.naver.com" not in page.url:
+            self._log("이미 네이버 로그인 상태입니다.")
+            return
+
+        if not self._login_to_naver(page, target_url):
+            raise RuntimeError(
+                "네이버 자동 로그인을 완료하지 못했습니다. 브라우저 화면에서 추가 인증 또는 보안확인 화면을 확인하세요."
+            )
+
+    def _naver_credentials(self) -> tuple[str, str] | None:
+        login_id = os.getenv("NAVER_LOGIN_ID", "").strip()
+        password = os.getenv("NAVER_LOGIN_PASSWORD", "")
+        if login_id and password:
+            return login_id, password
+        return None
+
+    def _login_to_naver(self, page: Page, target_url: str) -> bool:
+        credentials = self._naver_credentials()
+        if not credentials:
+            self._log("네이버 로그인 정보가 설정되어 있지 않아 자동 로그인을 건너뜁니다.")
+            return False
+
+        login_id, password = credentials
+        try:
+            page.locator("#id").wait_for(state="visible", timeout=15_000)
+            id_input = page.locator("#id")
+            pw_input = page.locator("#pw")
+
+            id_input.click(timeout=5_000)
+            page.keyboard.press("Control+A")
+            page.keyboard.type(login_id, delay=35)
+            pw_input.click(timeout=5_000)
+            page.keyboard.press("Control+A")
+            page.keyboard.type(password, delay=35)
+
+            clicked = False
+            for selector in ("#log\\.login", "button[type='submit']", ".btn_login"):
+                try:
+                    button = page.locator(selector).first
+                    if button.count():
+                        button.click(timeout=5_000)
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if not clicked:
+                page.keyboard.press("Enter")
+
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=20_000)
+            except Exception:
+                pass
+            page.wait_for_timeout(2_000)
+
+            if "nid.naver.com" not in page.url:
+                return True
+
+            body_text = ""
+            try:
+                body_text = page.locator("body").inner_text(timeout=2_000)
+            except Exception:
+                pass
+            if any(keyword in body_text for keyword in ("2단계", "OTP", "보안", "캡차", "자동입력", "인증")):
+                self._log("네이버 추가 인증 또는 보안확인 화면이 표시되었습니다.")
+            else:
+                self._log("네이버 자동 로그인 후에도 로그인 페이지가 유지됩니다.")
+            self._capture_screenshot(page, force=True)
+            return False
+        except Exception as exc:
+            self._log(f"네이버 자동 로그인 실패: {exc}")
+            self._capture_screenshot(page, force=True)
+            return False
 
     def _is_access_limited_page(self, page: Page) -> bool:
         try:

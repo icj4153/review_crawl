@@ -31,6 +31,13 @@ python app.py
 
 ## 웹 서비스 실행
 
+네이버 로그인이 필요한 경우 `.env` 파일을 만들고 아래 값을 설정합니다. `.env`는 GitHub에 올리지 않습니다.
+
+```text
+NAVER_LOGIN_ID=네이버아이디
+NAVER_LOGIN_PASSWORD=네이버비밀번호
+```
+
 로컬 테스트:
 
 ```powershell
