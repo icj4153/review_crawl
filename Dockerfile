@@ -17,4 +17,4 @@ COPY . .
 
 EXPOSE 8502
 
-CMD ["xvfb-run", "-a", "--server-args=-screen 0 1365x900x24", "gunicorn", "--bind=0.0.0.0:8502", "--workers=1", "--threads=4", "--timeout=600", "web_app:app"]
+CMD ["sh", "-lc", "Xvfb :99 -screen 0 1365x900x24 -nolisten tcp >/tmp/xvfb.log 2>&1 & export DISPLAY=:99; sleep 1; exec gunicorn --bind=0.0.0.0:8502 --workers=1 --threads=4 --timeout=600 web_app:app"]
