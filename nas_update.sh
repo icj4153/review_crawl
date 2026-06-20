@@ -29,4 +29,6 @@ fi
 
 mkdir -p output
 
+"$DOCKER" rm -f naver-review-web 2>/dev/null || true
+
 "$COMPOSE" up -d --build
