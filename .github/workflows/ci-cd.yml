@@ -120,8 +120,17 @@ jobs:
           set -euo pipefail
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          printf '%s\n' "$NAS_SSH_PRIVATE_KEY" > ~/.ssh/nas_deploy_key
-          printf '%s\n' "$NAS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          ssh_dir = Path.home() / ".ssh"
+          private_key = os.environ["NAS_SSH_PRIVATE_KEY"].strip().replace("\\n", "\n")
+          known_hosts = os.environ["NAS_KNOWN_HOSTS"].strip().replace("\\n", "\n")
+
+          (ssh_dir / "nas_deploy_key").write_text(private_key + "\n", encoding="utf-8")
+          (ssh_dir / "known_hosts").write_text(known_hosts + "\n", encoding="utf-8")
+          PY
           chmod 600 ~/.ssh/nas_deploy_key
           chmod 644 ~/.ssh/known_hosts
           ssh-keygen -y -f ~/.ssh/nas_deploy_key >/dev/null
