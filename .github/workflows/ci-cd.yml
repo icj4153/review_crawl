@@ -84,18 +84,28 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
-      - name: Validate required secrets
+      - name: Detect deployment configuration
+        id: deploy_config
         shell: bash
         run: |
           set -euo pipefail
-          missing=0
+          required=(NAS_HOST NAS_PORT NAS_USER NAS_SSH_PRIVATE_KEY NAS_KNOWN_HOSTS)
+          missing=()
           for name in NAS_HOST NAS_PORT NAS_USER NAS_SSH_PRIVATE_KEY NAS_KNOWN_HOSTS; do
             if [ -z "${!name:-}" ]; then
-              echo "::error::Missing required GitHub Secret: $name"
-              missing=1
+              missing+=("$name")
             fi
           done
-          exit "$missing"
+          if [ "${#missing[@]}" -eq "${#required[@]}" ]; then
+            echo "::notice::NAS deployment secrets are not configured yet. Skipping deployment."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf '::error::Missing required GitHub Secret: %s\n' "${missing[@]}"
+            exit 1
+          fi
+          echo "configured=true" >> "$GITHUB_OUTPUT"
         env:
           NAS_HOST: ${{ secrets.NAS_HOST }}
           NAS_PORT: ${{ secrets.NAS_PORT }}
@@ -104,6 +114,7 @@ jobs:
           NAS_KNOWN_HOSTS: ${{ secrets.NAS_KNOWN_HOSTS }}
 
       - name: Configure SSH
+        if: steps.deploy_config.outputs.configured == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -119,6 +130,7 @@ jobs:
           NAS_KNOWN_HOSTS: ${{ secrets.NAS_KNOWN_HOSTS }}
 
       - name: Verify NAS SSH
+        if: steps.deploy_config.outputs.configured == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -134,6 +146,7 @@ jobs:
           NAS_USER: ${{ secrets.NAS_USER }}
 
       - name: Deploy on NAS
+        if: steps.deploy_config.outputs.configured == 'true'
         shell: bash
         run: |
           set -euo pipefail
