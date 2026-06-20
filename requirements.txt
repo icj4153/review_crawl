@@ -2,4 +2,5 @@ playwright>=1.56.0
 openpyxl>=3.1.5
 flask>=3.0.0
 gunicorn>=23.0.0
+requests>=2.32.0
 pyinstaller>=6.16.0

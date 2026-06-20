@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+import mimetypes
 import os
 import re
 import threading
 import uuid
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
+import requests
 from flask import Flask, jsonify, request, send_file
+from openpyxl import load_workbook
 
 from crawler import (
     NaverReviewCrawler,
@@ -22,12 +27,22 @@ from excel_writer import save_reviews_xlsx
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = Path(os.getenv("REVIEW_OUTPUT_DIR", str(BASE_DIR / "output")))
+IMAGE_ZIP_DIR = OUTPUT_DIR / ".image_zips"
 MAX_RECENT_FILES = 20
 MAX_JOB_HISTORY = 30
+MAX_IMAGE_ZIP_HISTORY = 30
+IMAGE_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+    ),
+    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+}
 
 app = Flask(__name__)
 jobs_lock = threading.Lock()
 jobs: dict[str, "CollectJob"] = {}
+image_zip_jobs: dict[str, "ImageZipJob"] = {}
 
 
 @dataclass
@@ -82,6 +97,48 @@ class CollectJob:
             }
 
 
+@dataclass
+class ImageZipJob:
+    id: str
+    filename: str
+    source_path: str
+    status: str = "running"
+    created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    completed_at: str = ""
+    logs: list[str] = field(default_factory=list)
+    matching_review_count: int = 0
+    total_images: int = 0
+    downloaded_images: int = 0
+    failed_images: int = 0
+    zip_path: str = ""
+    zip_filename: str = ""
+    error: str = ""
+
+    def add_log(self, message: str) -> None:
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] {message}"
+        with jobs_lock:
+            self.logs.append(line)
+            self.logs = self.logs[-200:]
+
+    def snapshot(self) -> dict[str, Any]:
+        with jobs_lock:
+            return {
+                "id": self.id,
+                "filename": self.filename,
+                "status": self.status,
+                "created_at": self.created_at,
+                "completed_at": self.completed_at,
+                "logs": list(self.logs),
+                "matching_review_count": self.matching_review_count,
+                "total_images": self.total_images,
+                "downloaded_images": self.downloaded_images,
+                "failed_images": self.failed_images,
+                "zip_filename": self.zip_filename,
+                "error": self.error,
+                "download_url": f"/download/images/{self.id}" if self.zip_path else "",
+            }
+
+
 def safe_filename(value: str, default: str = "naver_reviews") -> str:
     cleaned = re.sub(r'[\\/:*?"<>|]+', "_", value).strip().strip(".")
     cleaned = re.sub(r"\s+", " ", cleaned)
@@ -97,6 +154,171 @@ def output_name(product_name: str) -> str:
 def list_recent_files(limit: int = MAX_RECENT_FILES) -> list[Path]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     return sorted(OUTPUT_DIR.glob("*.xlsx"), key=lambda path: path.stat().st_mtime, reverse=True)[:limit]
+
+
+def resolve_output_xlsx(filename: str) -> Path:
+    name = str(filename or "").strip()
+    if not name or "/" in name or "\\" in name or Path(name).name != name:
+        raise ValueError("파일명이 올바르지 않습니다.")
+    if not name.lower().endswith(".xlsx"):
+        raise ValueError("엑셀 파일만 처리할 수 있습니다.")
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    base = OUTPUT_DIR.resolve()
+    path = (OUTPUT_DIR / name).resolve()
+    try:
+        path.relative_to(base)
+    except ValueError as exc:
+        raise ValueError("출력 폴더 밖의 파일은 처리할 수 없습니다.") from exc
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError("파일을 찾을 수 없습니다.")
+    return path
+
+
+def parse_rating(value: object) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    match = re.search(r"\d+(?:\.\d+)?", str(value).strip())
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def parse_image_urls(value: object) -> list[str]:
+    if value is None:
+        return []
+    urls = []
+    for item in str(value).split(","):
+        url = item.strip().strip('"').strip("'")
+        if url.startswith(("http://", "https://")):
+            urls.append(url)
+    return urls
+
+
+def extension_from_url(url: str, content_type: str = "") -> str:
+    path = urlparse(url).path
+    ext = os.path.splitext(path)[1].lower()
+    if ext and re.fullmatch(r"\.[a-z0-9]{1,8}", ext):
+        return ext
+
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    guessed = mimetypes.guess_extension(media_type) if media_type else ""
+    if guessed == ".jpe":
+        return ".jpg"
+    return guessed or ".jpg"
+
+
+def prune_image_zip_jobs() -> None:
+    with jobs_lock:
+        if len(image_zip_jobs) <= MAX_IMAGE_ZIP_HISTORY:
+            return
+        removable = sorted(
+            (job for job in image_zip_jobs.values() if job.status in {"done", "error"}),
+            key=lambda job: job.completed_at or job.created_at,
+        )
+        for job in removable[: max(0, len(image_zip_jobs) - MAX_IMAGE_ZIP_HISTORY)]:
+            image_zip_jobs.pop(job.id, None)
+
+
+def run_image_zip_job(job: ImageZipJob) -> None:
+    source_path = Path(job.source_path)
+    zip_base = safe_filename(f"{source_path.stem}_이미지", default="naver_review_images")
+    zip_filename = f"{zip_base}.zip"
+    zip_path = IMAGE_ZIP_DIR / f"{job.id}_{zip_filename}"
+
+    try:
+        job.add_log(f"엑셀 파일 읽는 중: {source_path.name}")
+        IMAGE_ZIP_DIR.mkdir(parents=True, exist_ok=True)
+        workbook = load_workbook(source_path, data_only=True, read_only=True)
+        try:
+            sheet = workbook.active
+            rows = sheet.iter_rows(values_only=True)
+            header_row = next(rows, None)
+            if not header_row:
+                raise ValueError("엑셀 파일에 헤더 행이 없습니다.")
+
+            headers = [str(value).strip() if value is not None else "" for value in header_row]
+            try:
+                rating_index = headers.index("평점")
+                attachment_index = headers.index("첨부파일")
+            except ValueError as exc:
+                raise ValueError("엑셀 파일에서 '평점' 또는 '첨부파일' 열을 찾을 수 없습니다.") from exc
+
+            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for row_number, row in enumerate(rows, start=2):
+                    rating = row[rating_index] if rating_index < len(row) else None
+                    if parse_rating(rating) != 5.0:
+                        continue
+
+                    file_links = row[attachment_index] if attachment_index < len(row) else None
+                    image_urls = parse_image_urls(file_links)
+                    if not image_urls:
+                        continue
+
+                    with jobs_lock:
+                        job.matching_review_count += 1
+                        job.total_images += len(image_urls)
+
+                    for image_index, image_url in enumerate(image_urls, start=1):
+                        try:
+                            response = requests.get(
+                                image_url,
+                                headers=IMAGE_REQUEST_HEADERS,
+                                stream=True,
+                                timeout=(5, 20),
+                            )
+                            if response.status_code != 200:
+                                with jobs_lock:
+                                    job.failed_images += 1
+                                job.add_log(f"[실패] 상태 코드 {response.status_code} (행: {row_number})")
+                                continue
+
+                            ext = extension_from_url(image_url, response.headers.get("Content-Type", ""))
+                            member_name = f"리뷰{row_number}_{image_index}{ext}"
+                            with archive.open(member_name, "w") as member:
+                                for chunk in response.iter_content(64 * 1024):
+                                    if chunk:
+                                        member.write(chunk)
+
+                            with jobs_lock:
+                                job.downloaded_images += 1
+                            job.add_log(f"[성공] {member_name} 저장")
+                        except Exception as exc:
+                            with jobs_lock:
+                                job.failed_images += 1
+                            job.add_log(f"[오류] 행 {row_number} 이미지 다운로드 실패: {exc}")
+        finally:
+            workbook.close()
+
+        with jobs_lock:
+            if job.downloaded_images <= 0:
+                job.status = "error"
+                job.error = "평점 5점 리뷰 이미지가 없습니다."
+                job.completed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                job.status = "done"
+                job.zip_path = str(zip_path)
+                job.zip_filename = zip_filename
+                job.completed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if job.status == "done":
+            job.add_log(f"이미지 ZIP 생성 완료: {job.downloaded_images}개 저장")
+        else:
+            if zip_path.exists():
+                zip_path.unlink(missing_ok=True)
+            job.add_log(job.error)
+    except Exception as exc:
+        if zip_path.exists():
+            zip_path.unlink(missing_ok=True)
+        with jobs_lock:
+            job.status = "error"
+            job.error = str(exc)
+            job.completed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        job.add_log(f"오류: {exc}")
 
 
 def select_browser_mode() -> str:
@@ -255,6 +477,36 @@ def recent_files():
     return jsonify({"files": files})
 
 
+@app.post("/api/image-zips")
+def create_image_zip():
+    payload = request.get_json(silent=True) or {}
+    filename = str(payload.get("filename", "")).strip()
+    try:
+        source_path = resolve_output_xlsx(filename)
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    prune_image_zip_jobs()
+    zip_job_id = uuid.uuid4().hex
+    job = ImageZipJob(id=zip_job_id, filename=source_path.name, source_path=str(source_path))
+    with jobs_lock:
+        image_zip_jobs[job.id] = job
+    thread = threading.Thread(target=run_image_zip_job, args=(job,), daemon=True)
+    thread.start()
+    return jsonify(job.snapshot())
+
+
+@app.get("/api/image-zips/<zip_job_id>")
+def get_image_zip(zip_job_id: str):
+    with jobs_lock:
+        job = image_zip_jobs.get(zip_job_id)
+    if not job:
+        return jsonify({"error": "이미지 ZIP 작업을 찾을 수 없습니다."}), 404
+    return jsonify(job.snapshot())
+
+
 @app.get("/download/<job_id>")
 def download_job(job_id: str):
     with jobs_lock:
@@ -273,6 +525,18 @@ def download_file(filename: str):
         if path.name == filename:
             return send_file(path, as_attachment=True, download_name=path.name)
     return jsonify({"error": "파일을 찾을 수 없습니다."}), 404
+
+
+@app.get("/download/images/<zip_job_id>")
+def download_image_zip(zip_job_id: str):
+    with jobs_lock:
+        job = image_zip_jobs.get(zip_job_id)
+    if not job or not job.zip_path:
+        return jsonify({"error": "다운로드할 이미지 ZIP이 없습니다."}), 404
+    path = Path(job.zip_path)
+    if not path.exists():
+        return jsonify({"error": "이미지 ZIP 파일을 찾을 수 없습니다."}), 404
+    return send_file(path, as_attachment=True, download_name=job.zip_filename or path.name)
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -530,6 +794,26 @@ INDEX_HTML = r"""<!doctype html>
       color: var(--muted);
       font-size: 12px;
     }
+    .file-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+      margin-top: 10px;
+    }
+    .file-actions button,
+    .file-actions .download {
+      min-height: 34px;
+      padding: 7px 10px;
+      font-size: 12px;
+    }
+    .zip-status {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .zip-status.error { color: var(--danger); }
+    .zip-status.done { color: var(--success); }
     @media (max-width: 860px) {
       .shell {
         grid-template-columns: 1fr;
@@ -718,6 +1002,83 @@ INDEX_HTML = r"""<!doctype html>
       setMessage("중지 요청을 보냈습니다.");
     }
 
+    function escapeHtml(value) {
+      return String(value || "").replace(/[&<>"']/g, char => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        "\"": "&quot;",
+        "'": "&#39;"
+      }[char]));
+    }
+
+    function imageZipProgress(job) {
+      return `사진 리뷰 ${job.matching_review_count || 0}건 · 저장 ${job.downloaded_images || 0}개 · 실패 ${job.failed_images || 0}개`;
+    }
+
+    function renderImageZipJob(job, statusEl, button) {
+      if (job.status === "running") {
+        button.disabled = true;
+        statusEl.className = "zip-status";
+        statusEl.textContent = `이미지 ZIP 생성 중... ${imageZipProgress(job)}`;
+        return false;
+      }
+
+      button.disabled = false;
+      if (job.status === "done") {
+        statusEl.className = "zip-status done";
+        statusEl.innerHTML = `
+          <a class="download" href="${escapeHtml(job.download_url)}">이미지 ZIP 다운로드</a>
+          <div>${imageZipProgress(job)}</div>
+        `;
+      } else {
+        statusEl.className = "zip-status error";
+        statusEl.textContent = job.error || "이미지 ZIP 생성 중 오류가 발생했습니다.";
+      }
+      return true;
+    }
+
+    async function startImageZip(filename, button) {
+      const card = button.closest(".file");
+      const statusEl = card.querySelector(".zip-status");
+      button.disabled = true;
+      statusEl.className = "zip-status";
+      statusEl.textContent = "이미지 ZIP 생성 작업을 시작합니다.";
+
+      const res = await fetch("/api/image-zips", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        button.disabled = false;
+        statusEl.className = "zip-status error";
+        statusEl.textContent = data.error || "이미지 ZIP 작업을 시작하지 못했습니다.";
+        return;
+      }
+
+      renderImageZipJob(data, statusEl, button);
+      const timer = setInterval(async () => {
+        if (!document.body.contains(statusEl)) {
+          clearInterval(timer);
+          return;
+        }
+        const pollRes = await fetch(`/api/image-zips/${data.id}`);
+        const job = await pollRes.json();
+        if (!pollRes.ok) {
+          clearInterval(timer);
+          button.disabled = false;
+          statusEl.className = "zip-status error";
+          statusEl.textContent = job.error || "이미지 ZIP 상태를 확인하지 못했습니다.";
+          return;
+        }
+        if (renderImageZipJob(job, statusEl, button)) {
+          clearInterval(timer);
+        }
+      }, 1500);
+    }
+
     async function loadRecentFiles() {
       const res = await fetch("/api/files");
       const data = await res.json();
@@ -727,14 +1088,23 @@ INDEX_HTML = r"""<!doctype html>
       }
       files.innerHTML = data.files.map(file => `
         <div class="file">
-          <a href="${file.download_url}">${file.name}</a>
-          <span>${file.updated_at} · ${(file.size / 1024).toFixed(1)} KB</span>
+          <a href="${escapeHtml(file.download_url)}">${escapeHtml(file.name)}</a>
+          <span>${escapeHtml(file.updated_at)} · ${(file.size / 1024).toFixed(1)} KB</span>
+          <div class="file-actions">
+            <button class="secondary image-zip-btn" type="button" data-filename="${escapeHtml(file.name)}">이미지 ZIP 생성</button>
+          </div>
+          <div class="zip-status" aria-live="polite"></div>
         </div>
       `).join("");
     }
 
     startBtn.addEventListener("click", startJob);
     stopBtn.addEventListener("click", stopJob);
+    files.addEventListener("click", event => {
+      const button = event.target.closest(".image-zip-btn");
+      if (!button) return;
+      startImageZip(button.dataset.filename, button);
+    });
     loadRecentFiles();
   </script>
 </body>
