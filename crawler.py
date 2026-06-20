@@ -397,7 +397,7 @@ class NaverReviewCrawler:
         page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
         self._capture_screenshot(page, force=True)
         self._recover_login_redirect(page, target_url)
-        self._retry_access_limited_page(page)
+        self._retry_access_limited_page(page, target_url)
         self._dismiss_popups(page)
         self._product_name = self._read_product_name(page)
         if self._product_name:
@@ -507,14 +507,14 @@ class NaverReviewCrawler:
             or "잠시 후 다시 접속해 주시기 바랍니다" in text
         )
 
-    def _retry_access_limited_page(self, page: Page) -> None:
+    def _retry_access_limited_page(self, page: Page, target_url: str) -> None:
         for attempt in range(1, 4):
             if not self._is_access_limited_page(page):
                 return
             self._capture_screenshot(page, force=True)
-            self._log(f"네이버 접속 제한 화면이 표시되었습니다. 새로고침 재시도 {attempt}/3")
+            self._log(f"네이버 접속 제한 화면이 표시되었습니다. 주소창 URL 재입력 방식으로 재시도 {attempt}/3")
             page.wait_for_timeout(3_000)
-            page.reload(wait_until="domcontentloaded", timeout=60_000)
+            page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
             self._capture_screenshot(page, force=True)
 
         if self._is_access_limited_page(page):
