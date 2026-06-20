@@ -34,10 +34,12 @@ class CollectJob:
     id: str
     url: str
     max_reviews: int
+    visible_browser: bool = True
     status: str = "running"
     created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     completed_at: str = ""
     logs: list[str] = field(default_factory=list)
+    screenshot_path: str = ""
     output_path: str = ""
     filename: str = ""
     review_count: int = 0
@@ -53,14 +55,24 @@ class CollectJob:
 
     def snapshot(self) -> dict[str, Any]:
         with jobs_lock:
+            screenshot_url = ""
+            screenshot_updated_at = 0
+            if self.screenshot_path:
+                path = Path(self.screenshot_path)
+                if path.exists():
+                    screenshot_url = f"/api/jobs/{self.id}/screenshot"
+                    screenshot_updated_at = int(path.stat().st_mtime_ns)
             return {
                 "id": self.id,
                 "url": self.url,
                 "max_reviews": self.max_reviews,
+                "visible_browser": self.visible_browser,
                 "status": self.status,
                 "created_at": self.created_at,
                 "completed_at": self.completed_at,
                 "logs": list(self.logs),
+                "screenshot_url": screenshot_url,
+                "screenshot_updated_at": screenshot_updated_at,
                 "filename": self.filename,
                 "review_count": self.review_count,
                 "image_review_count": self.image_review_count,
@@ -103,8 +115,15 @@ def run_collect_job(job: CollectJob) -> None:
         normalized_url = normalize_naver_store_product_url(job.url)
         job.add_log(f"수집 URL: {normalized_url}")
         job.add_log(f"최대 리뷰수: {job.max_reviews}")
+        if job.visible_browser:
+            job.add_log("브라우저 화면 보기 모드로 실행합니다.")
 
-        crawler = NaverReviewCrawler(browser_mode="chromium", headless=True, log=job.add_log)
+        crawler = NaverReviewCrawler(
+            browser_mode="chromium",
+            headless=not job.visible_browser,
+            screenshot_path=Path(job.screenshot_path) if job.screenshot_path else None,
+            log=job.add_log,
+        )
         reviews = crawler.collect(normalized_url, job.max_reviews, job.stop_event)
 
         if not reviews:
@@ -148,6 +167,7 @@ def create_job():
         max_reviews = int(payload.get("max_reviews", 80))
     except (TypeError, ValueError):
         max_reviews = 80
+    visible_browser = bool(payload.get("visible_browser", True))
 
     if not url:
         return jsonify({"error": "수집할 URL을 입력하세요."}), 400
@@ -157,7 +177,15 @@ def create_job():
         return jsonify({"error": "최대 리뷰수는 1부터 10000까지 입력할 수 있습니다."}), 400
 
     prune_jobs()
-    job = CollectJob(id=uuid.uuid4().hex, url=url, max_reviews=max_reviews)
+    job_id = uuid.uuid4().hex
+    screenshot_path = OUTPUT_DIR / ".screenshots" / f"{job_id}.jpg"
+    job = CollectJob(
+        id=job_id,
+        url=url,
+        max_reviews=max_reviews,
+        visible_browser=visible_browser,
+        screenshot_path=str(screenshot_path) if visible_browser else "",
+    )
     with jobs_lock:
         jobs[job.id] = job
     thread = threading.Thread(target=run_collect_job, args=(job,), daemon=True)
@@ -183,6 +211,20 @@ def stop_job(job_id: str):
     job.stop_event.set()
     job.add_log("중지 요청을 보냈습니다. 현재 처리 지점 이후 안전하게 멈춥니다.")
     return jsonify(job.snapshot())
+
+
+@app.get("/api/jobs/<job_id>/screenshot")
+def job_screenshot(job_id: str):
+    with jobs_lock:
+        job = jobs.get(job_id)
+    if not job or not job.screenshot_path:
+        return jsonify({"error": "브라우저 화면이 없습니다."}), 404
+    path = Path(job.screenshot_path)
+    if not path.exists():
+        return jsonify({"error": "브라우저 화면이 아직 준비되지 않았습니다."}), 404
+    response = send_file(path, mimetype="image/jpeg")
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
 
 
 @app.get("/api/files")
@@ -311,6 +353,26 @@ INDEX_HTML = r"""<!doctype html>
       margin-top: 14px;
       align-items: end;
     }
+    .options {
+      display: grid;
+      gap: 6px;
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .checkline {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin: 0;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .checkline input {
+      width: 16px;
+      height: 16px;
+      margin: 0;
+    }
     .actions {
       display: flex;
       justify-content: flex-end;
@@ -388,6 +450,47 @@ INDEX_HTML = r"""<!doctype html>
       font: 13px/1.55 var(--mono);
       white-space: pre-wrap;
     }
+    .browser-view {
+      margin-top: 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #0b1220;
+    }
+    .browser-view.hidden {
+      display: none;
+    }
+    .browser-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 10px 12px;
+      background: #f5f8fc;
+      color: var(--text);
+      border-bottom: 1px solid var(--line);
+      font-size: 13px;
+      font-weight: 800;
+    }
+    .browser-title span {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .browser-frame {
+      aspect-ratio: 1280 / 900;
+      display: grid;
+      place-items: center;
+      color: #cbd5e1;
+      font-size: 13px;
+    }
+    .browser-frame img {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      background: #111827;
+    }
     .side h2 {
       margin: 0 0 12px;
       font-size: 16px;
@@ -461,6 +564,13 @@ INDEX_HTML = r"""<!doctype html>
           <button id="stopBtn" class="danger" type="button" disabled>중지</button>
         </div>
       </div>
+      <div class="options">
+        <label class="checkline" for="visibleBrowser">
+          <input id="visibleBrowser" type="checkbox" checked>
+          브라우저 화면 보기
+        </label>
+        <div>문제 확인용 모드입니다. NAS에서는 가상 브라우저 화면이 아래에 표시됩니다.</div>
+      </div>
       <div id="message" class="message">대기 중입니다.</div>
       <div class="status">
         <div class="metric"><div class="name">상태</div><div id="statusValue" class="value">대기</div></div>
@@ -468,6 +578,13 @@ INDEX_HTML = r"""<!doctype html>
         <div class="metric"><div class="name">이미지 포함</div><div id="imageCount" class="value">0</div></div>
       </div>
       <div id="downloadArea" style="margin-top: 14px;"></div>
+      <div id="browserView" class="browser-view hidden">
+        <div class="browser-title">
+          브라우저 화면
+          <span>수집 중 자동 갱신</span>
+        </div>
+        <div id="browserFrame" class="browser-frame">브라우저가 준비되면 화면이 표시됩니다.</div>
+      </div>
       <pre id="logs">프로그램 사용 준비가 되었습니다.</pre>
     </section>
 
@@ -480,6 +597,7 @@ INDEX_HTML = r"""<!doctype html>
   <script>
     const urlInput = document.getElementById("url");
     const maxReviewsInput = document.getElementById("maxReviews");
+    const visibleBrowser = document.getElementById("visibleBrowser");
     const startBtn = document.getElementById("startBtn");
     const stopBtn = document.getElementById("stopBtn");
     const message = document.getElementById("message");
@@ -488,6 +606,8 @@ INDEX_HTML = r"""<!doctype html>
     const imageCount = document.getElementById("imageCount");
     const logs = document.getElementById("logs");
     const downloadArea = document.getElementById("downloadArea");
+    const browserView = document.getElementById("browserView");
+    const browserFrame = document.getElementById("browserFrame");
     const files = document.getElementById("files");
     let currentJobId = null;
     let pollTimer = null;
@@ -499,6 +619,15 @@ INDEX_HTML = r"""<!doctype html>
 
     function renderJob(job) {
       currentJobId = job.id;
+      if (job.visible_browser) {
+        browserView.classList.remove("hidden");
+        if (job.screenshot_url) {
+          browserFrame.innerHTML = `<img alt="브라우저 화면" src="${job.screenshot_url}?v=${job.screenshot_updated_at}">`;
+        }
+      } else {
+        browserView.classList.add("hidden");
+        browserFrame.textContent = "브라우저 화면 보기 모드가 꺼져 있습니다.";
+      }
       statusValue.textContent = {
         running: "수집 중",
         done: "완료",
@@ -513,10 +642,12 @@ INDEX_HTML = r"""<!doctype html>
       if (job.status === "running") {
         startBtn.disabled = true;
         stopBtn.disabled = false;
+        visibleBrowser.disabled = true;
         setMessage("리뷰를 수집하고 있습니다. 창을 닫지 마세요.");
       } else {
         startBtn.disabled = false;
         stopBtn.disabled = true;
+        visibleBrowser.disabled = false;
         clearInterval(pollTimer);
         pollTimer = null;
         loadRecentFiles();
@@ -542,13 +673,20 @@ INDEX_HTML = r"""<!doctype html>
 
     async function startJob() {
       downloadArea.innerHTML = "";
+      browserFrame.textContent = "브라우저가 준비되면 화면이 표시됩니다.";
+      if (visibleBrowser.checked) {
+        browserView.classList.remove("hidden");
+      } else {
+        browserView.classList.add("hidden");
+      }
       setMessage("작업을 시작합니다.");
       const res = await fetch("/api/jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           url: urlInput.value,
-          max_reviews: maxReviewsInput.value
+          max_reviews: maxReviewsInput.value,
+          visible_browser: visibleBrowser.checked
         })
       });
       const data = await res.json();

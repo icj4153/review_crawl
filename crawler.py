@@ -305,17 +305,23 @@ class NaverReviewCrawler:
         edge_path: str | None = None,
         browser_mode: str = "edge",
         headless: bool = False,
+        screenshot_path: Path | None = None,
+        screenshot_interval_seconds: float = 1.0,
         log: LogCallback | None = None,
     ) -> None:
         self.profile_dir = profile_dir or default_profile_dir()
         self.edge_path = edge_path or resolve_edge_path()
         self.browser_mode = browser_mode
         self.headless = headless
+        self.screenshot_path = screenshot_path
+        self.screenshot_interval_seconds = screenshot_interval_seconds
         self.log = log or (lambda message: None)
         self._reviews: dict[str, Review] = {}
         self._product_name = ""
         self._product_no = ""
         self._lock = threading.Lock()
+        self._last_screenshot_at = 0.0
+        self._screenshot_error_logged = False
 
     @property
     def reviews(self) -> list[Review]:
@@ -324,6 +330,27 @@ class NaverReviewCrawler:
 
     def _log(self, message: str) -> None:
         self.log(message)
+
+    def _capture_screenshot(self, page: Page, *, force: bool = False) -> None:
+        if not self.screenshot_path:
+            return
+        now = time.monotonic()
+        if not force and now - self._last_screenshot_at < self.screenshot_interval_seconds:
+            return
+        try:
+            self.screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+            page.screenshot(
+                path=str(self.screenshot_path),
+                type="jpeg",
+                quality=74,
+                full_page=False,
+                timeout=3_000,
+            )
+            self._last_screenshot_at = now
+        except Exception as exc:
+            if not self._screenshot_error_logged:
+                self._log(f"브라우저 화면 캡처 실패: {exc}")
+                self._screenshot_error_logged = True
 
     def _add_reviews(self, reviews: list[Review], max_reviews: int) -> int:
         added = 0
@@ -344,6 +371,13 @@ class NaverReviewCrawler:
             raise RuntimeError("Microsoft Edge 실행 파일을 찾을 수 없습니다.")
 
         self._reviews.clear()
+        self._last_screenshot_at = 0.0
+        self._screenshot_error_logged = False
+        if self.screenshot_path:
+            try:
+                self.screenshot_path.unlink(missing_ok=True)
+            except Exception:
+                pass
         target_url = normalize_naver_store_product_url(url)
         if target_url != url.strip():
             self._log(f"입력 URL을 기본 상품 URL로 정리했습니다: {target_url}")
@@ -361,12 +395,15 @@ class NaverReviewCrawler:
     def _collect_from_page(self, page: Page, target_url: str, max_reviews: int, stop_event: threading.Event) -> None:
         self._log("상품 페이지로 바로 이동 중...")
         page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
+        self._capture_screenshot(page, force=True)
         self._recover_login_redirect(page, target_url)
         self._dismiss_popups(page)
         self._product_name = self._read_product_name(page)
         if self._product_name:
             self._log(f"상품명: {self._product_name}")
+        self._capture_screenshot(page, force=True)
         self._open_full_review_list_from_screen(page, stop_event)
+        self._capture_screenshot(page, force=True)
         self._crawl_visible_screen_reviews(page, max_reviews, stop_event)
         if len(self.reviews) < max_reviews:
             self._log("화면에서 더 이상 새 리뷰가 보이지 않아 현재 수집분으로 종료합니다.")
@@ -420,7 +457,8 @@ class NaverReviewCrawler:
             shutil.rmtree(runtime_profile_dir, ignore_errors=True)
 
     def _collect_with_chromium(self, playwright: Any, target_url: str, max_reviews: int, stop_event: threading.Event) -> None:
-        self._log("Chromium headless 브라우저 실행 중...")
+        mode_label = "화면 보기" if not self.headless else "headless"
+        self._log(f"Chromium {mode_label} 브라우저 실행 중...")
         browser = playwright.chromium.launch(
             headless=self.headless,
             args=[
@@ -510,9 +548,11 @@ class NaverReviewCrawler:
             if clicked:
                 tab_clicked = True
                 page.wait_for_timeout(1_800)
+                self._capture_screenshot(page, force=True)
                 break
             page.evaluate("window.scrollBy(0, Math.floor(window.innerHeight * 0.45))")
             page.wait_for_timeout(800)
+            self._capture_screenshot(page)
 
         if not tab_clicked:
             self._log("리뷰 탭 버튼을 찾지 못했습니다. 현재 화면 기준으로 계속 진행합니다.")
@@ -537,10 +577,12 @@ class NaverReviewCrawler:
             )
             if clicked:
                 page.wait_for_timeout(2_500)
+                self._capture_screenshot(page, force=True)
                 self._log("리뷰 전체보기 화면을 열었습니다.")
                 return
             page.evaluate("window.scrollBy(0, Math.floor(window.innerHeight * 0.55))")
             page.wait_for_timeout(800)
+            self._capture_screenshot(page)
 
         self._log("리뷰 전체보기 버튼을 찾지 못해 현재 상품 화면에 보이는 리뷰만 수집합니다.")
 
@@ -560,6 +602,7 @@ class NaverReviewCrawler:
             added = self._add_reviews(reviews, max_reviews)
             if added:
                 self._log(f"화면에서 리뷰 {added}건 수집됨 (총 {len(self.reviews)}건)")
+            self._capture_screenshot(page)
 
             current_count = len(self.reviews)
             if current_count == previous_count:
@@ -575,6 +618,7 @@ class NaverReviewCrawler:
             if not moved:
                 stagnant_turns += 3
             page.wait_for_timeout(180)
+            self._capture_screenshot(page)
 
     def _scroll_review_screen(self, page: Page) -> bool:
         result = page.evaluate(
