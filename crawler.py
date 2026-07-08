@@ -1233,7 +1233,7 @@ class NaverReviewCrawler:
 
     def _looks_like_screen_review_option(self, line: str, *, has_content: bool) -> bool:
         text = re.sub(r"\s+", " ", line).strip()
-        if not text or len(text) > 180:
+        if not text or len(text) > 260:
             return False
         if self._is_screen_chrome_line(text):
             return False
@@ -1258,8 +1258,8 @@ class NaverReviewCrawler:
         if has_content or ":" not in normalized:
             return False
 
-        key, value = [part.strip() for part in normalized.split(":", 1)]
-        if not key or not value or len(key) > 24 or len(value) > 130:
+        key, value = self._split_screen_review_option(normalized)
+        if not key or not value or len(key) > 80 or len(value) > 150:
             return False
         if key in {"평점", "작성일", "리뷰", "사진/비디오 수"}:
             return False
@@ -1282,6 +1282,9 @@ class NaverReviewCrawler:
         }
         if key in survey_keywords:
             return False
+        return self._has_screen_review_option_key(key)
+
+    def _has_screen_review_option_key(self, key: str) -> bool:
         option_key_keywords = (
             "선택",
             "옵션",
@@ -1306,10 +1309,23 @@ class NaverReviewCrawler:
         )
         return any(keyword in key for keyword in option_key_keywords)
 
+    def _split_screen_review_option(self, text: str) -> tuple[str, str]:
+        normalized = text.replace("：", ":")
+        if ":" not in normalized:
+            return "", ""
+        key, value = [part.strip() for part in normalized.rsplit(":", 1)]
+        if "/" in key:
+            key = key.rsplit("/", 1)[-1].strip()
+        key = re.sub(r"^[^\w가-힣\[]+", "", key).strip()
+        return key, value
+
     def _clean_screen_review_option(self, line: str) -> str:
         text = re.sub(r"\s+", " ", line).strip()
         text = text.replace("：", ":")
         text = re.sub(r"^\[?(?:선택\s*)?옵션\]?\s*[:：]?\s*", "", text).strip()
+        key, value = self._split_screen_review_option(text)
+        if key and value and self._has_screen_review_option_key(key):
+            return value
         return text
 
     def _trim_screen_review_chunk(self, lines: list[str]) -> list[str]:

@@ -41,6 +41,7 @@ jobs:
           from openpyxl import load_workbook
 
           from crawler import (
+              NaverReviewCrawler,
               Review,
               is_supported_naver_store_url,
               normalize_naver_store_product_url,
@@ -74,6 +75,18 @@ jobs:
           assert sheet.cell(2, 8).value == "1kg"
           assert sheet.cell(2, 9).value == "https://example.com/a.jpg"
           output.unlink()
+
+          crawler = NaverReviewCrawler()
+          option_line = (
+              "[\U0001f349]14\uc2dc \uc774\uc804 \ub2f9\uc77c\ucd9c\ubc1c: "
+              "\u23f0 \ud0c0\uc784\ud2b9\uac00(\uc804\uad6d\ucd5c\uc800\uac00) / "
+              "\u23f1 \ud06c\uae30 \ubc0f \uc911\ub7c9 \uc120\ud0dd: "
+              "[\uc120\ucc29\uc21c] \uc77c\ubc18\ub4f1\uae09 9~10kg(10\uc778\ubd84)"
+          )
+          assert crawler._looks_like_screen_review_option(option_line, has_content=False)
+          assert crawler._clean_screen_review_option(option_line) == (
+              "[\uc120\ucc29\uc21c] \uc77c\ubc18\ub4f1\uae09 9~10kg(10\uc778\ubd84)"
+          )
           PY
 
       - name: Docker build
