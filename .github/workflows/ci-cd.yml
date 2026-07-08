@@ -87,6 +87,11 @@ jobs:
           assert crawler._clean_screen_review_option(option_line) == (
               "[\uc120\ucc29\uc21c] \uc77c\ubc18\ub4f1\uae09 9~10kg(10\uc778\ubd84)"
           )
+          watermelon_option_line = "\uafc0\uc218\ubc15:\u25c6\uc218\ubc15 9kg \uc774\uc0c1 \ud2b9\ub300"
+          assert crawler._looks_like_screen_review_option(watermelon_option_line, has_content=False)
+          assert crawler._clean_screen_review_option(watermelon_option_line) == (
+              "\u25c6\uc218\ubc15 9kg \uc774\uc0c1 \ud2b9\ub300"
+          )
           PY
 
       - name: Docker build

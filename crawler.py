@@ -1282,7 +1282,7 @@ class NaverReviewCrawler:
         }
         if key in survey_keywords:
             return False
-        return self._has_screen_review_option_key(key)
+        return self._has_screen_review_option_key(key) or self._looks_like_screen_review_option_value(value)
 
     def _has_screen_review_option_key(self, key: str) -> bool:
         option_key_keywords = (
@@ -1309,6 +1309,33 @@ class NaverReviewCrawler:
         )
         return any(keyword in key for keyword in option_key_keywords)
 
+    def _looks_like_screen_review_option_value(self, value: str) -> bool:
+        text = re.sub(r"\s+", " ", value).strip()
+        if not text or len(text) > 150:
+            return False
+        if re.search(r"[.!?。ㅠㅎ]{2,}", text):
+            return False
+        if re.search(r"(?:\d+(?:\.\d+)?\s*(?:kg|g|그램|킬로|개|입|팩|박스|box|BOX|인분|구|과|호))", text):
+            return True
+        option_value_keywords = (
+            "특대",
+            "대과",
+            "중과",
+            "소과",
+            "왕특",
+            "일반등급",
+            "프리미엄",
+            "특품",
+            "못난이",
+            "가정용",
+            "선물용",
+            "실속",
+            "혼합",
+            "랜덤",
+            "세트",
+        )
+        return any(keyword in text for keyword in option_value_keywords)
+
     def _split_screen_review_option(self, text: str) -> tuple[str, str]:
         normalized = text.replace("：", ":")
         if ":" not in normalized:
@@ -1324,7 +1351,9 @@ class NaverReviewCrawler:
         text = text.replace("：", ":")
         text = re.sub(r"^\[?(?:선택\s*)?옵션\]?\s*[:：]?\s*", "", text).strip()
         key, value = self._split_screen_review_option(text)
-        if key and value and self._has_screen_review_option_key(key):
+        if key and value and (
+            self._has_screen_review_option_key(key) or self._looks_like_screen_review_option_value(value)
+        ):
             return value
         return text
 
