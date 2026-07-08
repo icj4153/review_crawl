@@ -64,13 +64,15 @@ jobs:
                   created_at="2026-06-20 00:00:00",
                   rating="5",
                   content="good",
+                  option="1kg",
                   image_urls=["https://example.com/a.jpg"],
               )
           ]
           save_reviews_xlsx(reviews, output)
           sheet = load_workbook(output).active
-          assert [sheet.cell(1, col).value for col in range(1, 9)] == HEADERS
-          assert sheet.cell(2, 8).value == "https://example.com/a.jpg"
+          assert [sheet.cell(1, col).value for col in range(1, len(HEADERS) + 1)] == HEADERS
+          assert sheet.cell(2, 8).value == "1kg"
+          assert sheet.cell(2, 9).value == "https://example.com/a.jpg"
           output.unlink()
           PY
 

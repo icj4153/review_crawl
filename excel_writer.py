@@ -8,7 +8,7 @@ from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 
 
-HEADERS = ["리뷰번호", "상품번호", "상품이름", "작성자", "작성일", "평점", "리뷰", "첨부파일"]
+HEADERS = ["리뷰번호", "상품번호", "상품이름", "작성자", "작성일", "평점", "리뷰", "옵션", "첨부파일"]
 
 
 def save_reviews_xlsx(reviews: Iterable[object], output_path: Path) -> Path:
@@ -33,6 +33,7 @@ def save_reviews_xlsx(reviews: Iterable[object], output_path: Path) -> Path:
                 getattr(review, "created_at", ""),
                 getattr(review, "rating", ""),
                 getattr(review, "content", ""),
+                getattr(review, "option", ""),
                 ",".join(image_urls),
             ]
         )
@@ -45,7 +46,8 @@ def save_reviews_xlsx(reviews: Iterable[object], output_path: Path) -> Path:
         "E": 19,
         "F": 10,
         "G": 110,
-        "H": 95,
+        "H": 36,
+        "I": 95,
     }
     for column, width in widths.items():
         sheet.column_dimensions[column].width = width

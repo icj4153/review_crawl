@@ -58,6 +58,7 @@ class Review:
     created_at: str
     rating: str
     content: str
+    option: str = ""
     image_urls: list[str] = field(default_factory=list)
 
 
@@ -172,6 +173,45 @@ def _first_value(data: dict[str, Any], keys: tuple[str, ...]) -> Any:
     return ""
 
 
+def _option_text_from_value(value: Any) -> str:
+    parts: list[str] = []
+
+    def visit(node: Any) -> None:
+        if node in (None, ""):
+            return
+        if isinstance(node, (str, int, float)):
+            text = str(node).strip()
+            if text:
+                parts.append(text)
+            return
+        if isinstance(node, list):
+            for item in node:
+                visit(item)
+            return
+        if isinstance(node, dict):
+            label = str(
+                _first_value(node, ("name", "optionName", "optionTitle", "optionTypeName", "groupName", "label"))
+            ).strip()
+            value_text = str(
+                _first_value(node, ("value", "optionValue", "optionValueName", "valueName", "text", "contents"))
+            ).strip()
+            if label and value_text and label != value_text:
+                parts.append(f"{label}: {value_text}")
+                return
+            if value_text:
+                parts.append(value_text)
+                return
+            if label:
+                parts.append(label)
+                return
+            for key, item in node.items():
+                if "option" in key.lower():
+                    visit(item)
+
+    visit(value)
+    return " / ".join(dict.fromkeys(parts))
+
+
 def _collect_image_urls(value: Any) -> list[str]:
     urls: list[str] = []
 
@@ -284,6 +324,29 @@ def _extract_review_from_dict(data: dict[str, Any], fallback_product_no: str, fa
     rating = str(
         _first_value(data, ("score", "rating", "starPoint", "reviewScore", "purchasePoint"))
     ).strip()
+    option = _option_text_from_value(
+        _first_value(
+            data,
+            (
+                "optionName",
+                "productOptionName",
+                "productOption",
+                "optionContents",
+                "optionContent",
+                "optionText",
+                "option",
+                "options",
+                "selectedOptions",
+                "purchaseOption",
+                "purchaseOptions",
+                "orderOption",
+                "orderOptions",
+                "itemOptionName",
+                "optionValue",
+                "optionValueName",
+            ),
+        )
+    )
 
     product_no = str(_first_value(data, ("productNo", "originProductNo", "itemNo")) or fallback_product_no).strip()
     product_name = str(_first_value(data, ("productName", "productTitle", "itemName")) or fallback_product_name).strip()
@@ -296,6 +359,7 @@ def _extract_review_from_dict(data: dict[str, Any], fallback_product_no: str, fa
         created_at=created_at,
         rating=rating,
         content=content,
+        option=option,
         image_urls=_collect_image_urls(data),
     )
 
@@ -1005,6 +1069,7 @@ class NaverReviewCrawler:
             raw_chunk = self._trim_screen_review_chunk(raw_chunk)
 
             photo_count = 0
+            option_lines: list[str] = []
             cleaned_lines: list[str] = []
             skip_next_photo_number = False
             for line in raw_chunk:
@@ -1020,6 +1085,9 @@ class NaverReviewCrawler:
                 if line in {"신고", "리뷰가 도움이 되었나요?"} or line.startswith("도움돼요"):
                     continue
                 if re.fullmatch(r"(?:[1-5]?재구매(?:한달사용)?|[1-5]?한달사용|재구매)", line):
+                    continue
+                if self._looks_like_screen_review_option(line, has_content=bool(cleaned_lines)):
+                    option_lines.append(self._clean_screen_review_option(line))
                     continue
                 if "구매자거주인원" in line or "식이관심사" in line:
                     continue
@@ -1048,9 +1116,10 @@ class NaverReviewCrawler:
                 continue
 
             assigned_images = self._pop_screen_review_images(image_groups_by_key, writer, date_text)
+            option = " / ".join(dict.fromkeys(line for line in option_lines if line))
 
             created_at = self._screen_date_to_full_date(date_text)
-            review_no = self._screen_review_no(writer, created_at, content)
+            review_no = self._screen_review_no(writer, created_at, content, option)
             reviews.append(
                 Review(
                     review_no=review_no,
@@ -1060,6 +1129,7 @@ class NaverReviewCrawler:
                     created_at=created_at,
                     rating=rating,
                     content=content,
+                    option=option,
                     image_urls=assigned_images,
                 )
             )
@@ -1161,6 +1231,87 @@ class NaverReviewCrawler:
             return []
         return groups.pop(0)
 
+    def _looks_like_screen_review_option(self, line: str, *, has_content: bool) -> bool:
+        text = re.sub(r"\s+", " ", line).strip()
+        if not text or len(text) > 180:
+            return False
+        if self._is_screen_chrome_line(text):
+            return False
+        if re.search(r"[.!?。ㅠㅎ]{2,}", text):
+            return False
+
+        normalized = text.replace("：", ":")
+        option_markers = (
+            "옵션",
+            "선택옵션",
+            "선택 옵션",
+            "구매옵션",
+            "구매 옵션",
+            "주문옵션",
+            "주문 옵션",
+        )
+        if any(marker in normalized for marker in option_markers):
+            if not has_content or ":" in normalized:
+                return True
+            return bool(re.match(r"^\[?(?:선택\s*)?(?:구매\s*)?(?:주문\s*)?옵션\b", normalized))
+
+        if has_content or ":" not in normalized:
+            return False
+
+        key, value = [part.strip() for part in normalized.split(":", 1)]
+        if not key or not value or len(key) > 24 or len(value) > 130:
+            return False
+        if key in {"평점", "작성일", "리뷰", "사진/비디오 수"}:
+            return False
+        survey_keywords = {
+            "크기",
+            "크기차",
+            "신선함",
+            "과숙정도",
+            "당도",
+            "맛",
+            "품질",
+            "가격",
+            "배송",
+            "포장",
+            "향",
+            "식감",
+            "만족도",
+            "구매자거주인원",
+            "식이관심사",
+        }
+        if key in survey_keywords:
+            return False
+        option_key_keywords = (
+            "선택",
+            "옵션",
+            "상품",
+            "제품",
+            "품목",
+            "구성",
+            "종류",
+            "색상",
+            "컬러",
+            "사이즈",
+            "크기",
+            "용량",
+            "중량",
+            "수량",
+            "개수",
+            "맛",
+            "향",
+            "타입",
+            "세트",
+            "포장",
+        )
+        return any(keyword in key for keyword in option_key_keywords)
+
+    def _clean_screen_review_option(self, line: str) -> str:
+        text = re.sub(r"\s+", " ", line).strip()
+        text = text.replace("：", ":")
+        text = re.sub(r"^\[?(?:선택\s*)?옵션\]?\s*[:：]?\s*", "", text).strip()
+        return text
+
     def _trim_screen_review_chunk(self, lines: list[str]) -> list[str]:
         trimmed: list[str] = []
         for line in lines:
@@ -1221,6 +1372,6 @@ class NaverReviewCrawler:
         year = 2000 + int(match.group(1))
         return f"{year:04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d} 00:00:00"
 
-    def _screen_review_no(self, writer: str, created_at: str, content: str) -> str:
-        digest = hashlib.sha1(f"{writer}|{created_at}|{content}".encode("utf-8")).hexdigest()[:16]
+    def _screen_review_no(self, writer: str, created_at: str, content: str, option: str = "") -> str:
+        digest = hashlib.sha1(f"{writer}|{created_at}|{option}|{content}".encode("utf-8")).hexdigest()[:16]
         return f"screen-{digest}"
