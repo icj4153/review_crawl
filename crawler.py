@@ -764,8 +764,12 @@ class NaverReviewCrawler:
     def _crawl_visible_screen_reviews(self, page: Page, max_reviews: int, stop_event: threading.Event) -> None:
         stagnant_turns = 0
         previous_count = -1
+        turn = 0
+        max_turns = max(1200, min(max_reviews * 4, 30000))
+        recovery_logs: set[int] = set()
 
-        for _ in range(500):
+        while turn < max_turns:
+            turn += 1
             if stop_event.is_set():
                 self._log("중지 요청을 확인했습니다.")
                 return
@@ -786,41 +790,169 @@ class NaverReviewCrawler:
                 stagnant_turns = 0
             previous_count = current_count
 
-            if stagnant_turns >= 24:
+            if stagnant_turns in {12, 30, 50} and stagnant_turns not in recovery_logs:
+                recovery_logs.add(stagnant_turns)
+                self._log("새 리뷰가 잠시 보이지 않아 스크롤 회복을 시도합니다.")
+                if self._recover_review_screen_scroll(page):
+                    page.wait_for_timeout(600)
+                    self._capture_screenshot(page)
+                    continue
+
+            if stagnant_turns >= 80:
+                if self._recover_review_screen_scroll(page):
+                    stagnant_turns = 50
+                    page.wait_for_timeout(900)
+                    self._capture_screenshot(page)
+                    continue
                 return
 
-            moved = self._scroll_review_screen(page)
+            moved = self._scroll_review_screen(page, aggressive=stagnant_turns >= 8)
             if not moved:
-                stagnant_turns += 3
-            page.wait_for_timeout(180)
+                stagnant_turns += 2
+            page.wait_for_timeout(220 if stagnant_turns < 8 else 420)
             self._capture_screenshot(page)
 
-    def _scroll_review_screen(self, page: Page) -> bool:
+        self._log(f"스크롤 안전 한도({max_turns}회)에 도달해 현재 수집분으로 종료합니다.")
+
+    def _scroll_review_screen(self, page: Page, *, aggressive: bool = False) -> bool:
+        before_state = self._review_scroll_state(page)
         result = page.evaluate(
-            """() => {
+            """(aggressive) => {
+                const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                const isVisible = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    return rect.width >= 320 && rect.height >= 180 && rect.bottom > 0 && rect.top < window.innerHeight;
+                };
                 const scrollables = Array.from(document.querySelectorAll('*'))
                     .filter((el) => {
                         const style = getComputedStyle(el);
                         const rect = el.getBoundingClientRect();
                         return (style.overflowY === 'auto' || style.overflowY === 'scroll')
                             && el.scrollHeight > el.clientHeight + 80
-                            && rect.width >= 520
-                            && rect.height >= 300;
+                            && rect.width >= 360
+                            && rect.height >= 220;
+                    })
+                    .map((el) => {
+                        const rect = el.getBoundingClientRect();
+                        const remain = el.scrollHeight - el.clientHeight - el.scrollTop;
+                        const text = textOf(el).slice(0, 3000);
+                        let score = remain;
+                        if (isVisible(el)) score += 100000;
+                        if (text.includes('평점') || text.includes('리뷰가 도움이 되었나요?')) score += 200000;
+                        if (text.includes('작성일') || text.includes('최신순')) score += 60000;
+                        if (rect.left >= -20 && rect.right <= window.innerWidth + 20) score += 20000;
+                        return { el, score, remain };
                     })
                     .sort((a, b) => {
-                        const aRemain = a.scrollHeight - a.clientHeight - a.scrollTop;
-                        const bRemain = b.scrollHeight - b.clientHeight - b.scrollTop;
-                        return bRemain - aRemain;
+                        return b.score - a.score;
                     });
-                const target = scrollables[0] || document.scrollingElement || document.documentElement;
-                const before = target.scrollTop || window.scrollY || 0;
-                const amount = Math.max(260, Math.floor((target.clientHeight || window.innerHeight) * 0.55));
-                target.scrollBy(0, amount);
-                const after = target.scrollTop || window.scrollY || 0;
-                return { before, after };
-            }"""
+                const targets = scrollables.map((item) => item.el);
+                const root = document.scrollingElement || document.documentElement;
+                if (root && !targets.includes(root)) targets.push(root);
+                const amount = Math.max(
+                    aggressive ? 950 : 420,
+                    Math.floor(window.innerHeight * (aggressive ? 0.92 : 0.68))
+                );
+                let moved = false;
+                const tried = [];
+                for (const target of targets.slice(0, aggressive ? 5 : 3)) {
+                    const before = target.scrollTop || 0;
+                    target.scrollBy(0, amount);
+                    target.dispatchEvent(new WheelEvent('wheel', { deltaY: amount, bubbles: true, cancelable: true }));
+                    const after = target.scrollTop || 0;
+                    tried.push({ before, after, height: target.scrollHeight, client: target.clientHeight });
+                    if (after > before) {
+                        moved = true;
+                        break;
+                    }
+                }
+                window.dispatchEvent(new WheelEvent('wheel', { deltaY: amount, bubbles: true, cancelable: true }));
+                return { moved, tried };
+            }""",
+            aggressive,
         )
-        return bool(result and result.get("after", 0) > result.get("before", 0))
+        if result and result.get("moved"):
+            return True
+
+        try:
+            page.mouse.wheel(0, 1400 if aggressive else 850)
+            page.wait_for_timeout(120)
+        except Exception:
+            pass
+        after_state = self._review_scroll_state(page)
+        return bool(after_state and after_state != before_state)
+
+    def _review_scroll_state(self, page: Page) -> str:
+        try:
+            return page.evaluate(
+                """() => {
+                    const root = document.scrollingElement || document.documentElement;
+                    const scrollables = Array.from(document.querySelectorAll('*'))
+                        .filter((el) => {
+                            const style = getComputedStyle(el);
+                            return (style.overflowY === 'auto' || style.overflowY === 'scroll')
+                                && el.scrollHeight > el.clientHeight + 80;
+                        })
+                        .sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))
+                        .slice(0, 8);
+                    const parts = [];
+                    if (root) parts.push(`root:${Math.round(root.scrollTop)}:${root.scrollHeight}:${root.clientHeight}`);
+                    for (const el of scrollables) {
+                        const rect = el.getBoundingClientRect();
+                        parts.push(`${Math.round(el.scrollTop)}:${el.scrollHeight}:${el.clientHeight}:${Math.round(rect.top)}:${Math.round(rect.bottom)}`);
+                    }
+                    return parts.join('|');
+                }"""
+            )
+        except Exception:
+            return ""
+
+    def _recover_review_screen_scroll(self, page: Page) -> bool:
+        clicked = False
+        try:
+            clicked = bool(
+                page.evaluate(
+                    """() => {
+                        const textOf = (el) => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                        const isVisible = (el) => {
+                            const rect = el.getBoundingClientRect();
+                            const style = getComputedStyle(el);
+                            return style.visibility !== 'hidden'
+                                && style.display !== 'none'
+                                && rect.width > 0
+                                && rect.height > 0
+                                && rect.bottom > 0
+                                && rect.top < window.innerHeight;
+                        };
+                        const candidates = Array.from(document.querySelectorAll('button, a'))
+                            .filter((el) => {
+                                if (!isVisible(el)) return false;
+                                const text = textOf(el);
+                                if (!text || text.includes('리뷰 전체보기')) return false;
+                                return /^(더보기|다음|다음 페이지|페이지 다음)$/.test(text)
+                                    || text === '>';
+                            });
+                        const target = candidates[0];
+                        if (!target) return false;
+                        target.scrollIntoView({ block: 'center' });
+                        target.click();
+                        return true;
+                    }"""
+                )
+            )
+        except Exception:
+            clicked = False
+        if clicked:
+            self._log("정체 구간에서 더보기/다음 버튼을 눌렀습니다.")
+            page.wait_for_timeout(1_200)
+            return True
+
+        moved = False
+        for _ in range(4):
+            if self._scroll_review_screen(page, aggressive=True):
+                moved = True
+            page.wait_for_timeout(220)
+        return moved
 
     def _extract_reviews_from_screen_text(self, page: Page) -> list[Review]:
         body_text = page.evaluate("() => document.body ? document.body.innerText : ''")
